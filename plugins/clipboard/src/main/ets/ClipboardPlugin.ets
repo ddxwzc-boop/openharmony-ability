@@ -1,5 +1,7 @@
 import pasteboard from "@ohos.pasteboard";
+import abilityAccessCtrl, { Permissions } from "@ohos.abilityAccessCtrl";
 import { image } from "@kit.ImageKit";
+import { buffer } from "@kit.ArkTS";
 import { BusinessError } from "@kit.BasicServicesKit";
 import {
   AsyncPluginBase,
@@ -15,6 +17,8 @@ const WRITE_TEXT_REQUEST_TYPE = "ohos.clipboard.WriteTextRequest";
 const WRITE_TEXT_RESPONSE_TYPE = "ohos.clipboard.WriteTextResponse";
 const WRITE_IMAGE_REQUEST_TYPE = "ohos.clipboard.WriteImageRequest";
 const WRITE_IMAGE_RESPONSE_TYPE = "ohos.clipboard.WriteImageResponse";
+const READ_IMAGE_REQUEST_TYPE = "ohos.clipboard.ReadImageRequest";
+const READ_IMAGE_RESPONSE_TYPE = "ohos.clipboard.ReadImageResponse";
 const WRITE_HTML_REQUEST_TYPE = "ohos.clipboard.WriteHtmlRequest";
 const WRITE_HTML_RESPONSE_TYPE = "ohos.clipboard.WriteHtmlResponse";
 const CLEAR_REQUEST_TYPE = "ohos.clipboard.ClearRequest";
@@ -41,6 +45,18 @@ class ReadTextResponse {
 
   constructor(text: string) {
     this.text = text;
+  }
+}
+
+class ReadImageResponse {
+  readonly pngBase64: string;
+  readonly width: number;
+  readonly height: number;
+
+  constructor(pngBase64: string, width: number, height: number) {
+    this.pngBase64 = pngBase64;
+    this.width = width;
+    this.height = height;
   }
 }
 
@@ -91,6 +107,15 @@ export class ClipboardPlugin extends AsyncPluginBase {
 
     if (action === "read-text") {
       expectBridgeRequestType(payload, "ohos.clipboard", action, READ_TEXT_REQUEST_TYPE);
+      // READ_PASTEBOARD gate (Eulogizethesun/tauri#102): since API 12 reading
+      // the pasteboard is governed by this restricted user_grant permission —
+      // without it getData() silently returns an empty PasteData. Request it
+      // before reading; see ensureReadPermission for the preconditions and the
+      // degradation contract.
+      await this.ensureReadPermission(context);
+      if (!context.isActive()) {
+        throw new Error("Ability was destroyed while clipboard permission request was pending");
+      }
       const systemPasteboard = pasteboard.getSystemPasteboard();
       const data = await systemPasteboard.getData();
       let text: string = "";
@@ -108,6 +133,20 @@ export class ClipboardPlugin extends AsyncPluginBase {
       return {
         typeName: READ_TEXT_RESPONSE_TYPE,
         value: new ReadTextResponse(text),
+      };
+    }
+
+    if (action === "read-image") {
+      expectBridgeRequestType(payload, "ohos.clipboard", action, READ_IMAGE_REQUEST_TYPE);
+      // Same READ_PASTEBOARD gate as read-text (API 12+ read restriction).
+      await this.ensureReadPermission(context);
+      if (!context.isActive()) {
+        throw new Error("Ability was destroyed while clipboard permission request was pending");
+      }
+      const result = await this.readImageFromClipboard();
+      return {
+        typeName: READ_IMAGE_RESPONSE_TYPE,
+        value: new ReadImageResponse(result.pngBase64, result.width, result.height),
       };
     }
 
@@ -182,6 +221,91 @@ export class ClipboardPlugin extends AsyncPluginBase {
     }
 
     throw new Error(`Unsupported ohos.clipboard action '${action}'`);
+  }
+
+  /**
+   * Ensures ohos.permission.READ_PASTEBOARD is granted before a pasteboard read.
+   *
+   * Preconditions for the request to succeed (official
+   * get-pastedata-permission-guidelines):
+   * 1. The app's module.json5 declares the permission (with reason/usedScene).
+   * 2. The signing profile's ACL contains it — restricted permission, but
+   *    "PC/2in1设备上的应用均可申请" (auto-approved on AGC).
+   *
+   * When either precondition is missing the request rejects or is denied.
+   * Both cases degrade to the historical behavior — getData() silently
+   * returning an empty PasteData → read-text resolves with "" — so this
+   * helper never turns a working (if empty) read into a hard failure.
+   * Requesting an already-granted permission resolves without a dialog.
+   */
+  private async ensureReadPermission(context: BridgeCallContext): Promise<void> {
+    try {
+      const atManager = abilityAccessCtrl.createAtManager();
+      const result = await atManager.requestPermissionsFromUser(
+        context.abilityContext,
+        ["ohos.permission.READ_PASTEBOARD"] as Permissions[],
+      );
+      const granted = (result.authResults ?? [])[0] === 0;
+      if (!granted) {
+        console.warn("[Clipboard] READ_PASTEBOARD denied — read-text will observe an empty pasteboard");
+      }
+    } catch (e) {
+      // Undeclared permission, missing ACL entry, or a non-interactive call
+      // context — degrade instead of failing the read.
+      console.warn("[Clipboard] READ_PASTEBOARD request failed: " + String(e));
+    }
+  }
+
+  /**
+   * Reads the primary image from the system clipboard and packs it as a
+   * base64 PNG plus its pixel dimensions.
+   *
+   * base64 (not raw bytes) — a Vec<u8> in a napi object would cross the
+   * bridge as Array<number>, inflating a multi-hundred-KB PNG ~8x in memory
+   * (same contract as WebviewPlugin's capture-webview).
+   *
+   * Throws when the clipboard holds no PixelMap record (the caller surfaces
+   * the error — matches arboard's behavior on the desktop path).
+   */
+  private async readImageFromClipboard(): Promise<{ pngBase64: string; width: number; height: number }> {
+    let pm: image.PixelMap | null = null;
+    let packer: image.ImagePacker | null = null;
+    try {
+      const systemPasteboard = pasteboard.getSystemPasteboard();
+      const data = await systemPasteboard.getData();
+      // getPrimaryPixelMap throws when the primary record is not a PixelMap;
+      // an empty board (e.g. READ_PASTEBOARD denied) yields null/undefined.
+      pm = (data.getPrimaryPixelMap() ?? null) as image.PixelMap | null;
+      if (pm == null) {
+        throw new Error("clipboard does not contain an image");
+      }
+      const info = pm.getImageInfoSync();
+      packer = image.createImagePacker();
+      // quality is REQUIRED by PackingOption in the API 12 typings even for PNG.
+      const packOptions: image.PackingOption = { format: "image/png", quality: 100 };
+      const arrayBuffer = await packer.packing(pm, packOptions);
+      if (!arrayBuffer || arrayBuffer.byteLength === 0) {
+        throw new Error("ImagePacker produced empty PNG buffer");
+      }
+      const pngBase64 = buffer.from(arrayBuffer).toString("base64");
+      return { pngBase64: pngBase64, width: info.size.width, height: info.size.height };
+    } catch (e) {
+      // BusinessError (pasteboard/packer) or the plain Errors thrown above.
+      const message = e instanceof Error ? e.message : String(e);
+      console.error(`[Clipboard] readImageFromClipboard failed: ${message}`);
+      throw new Error(`readImageFromClipboard failed: ${message}`);
+    } finally {
+      try {
+        packer?.release();
+      } catch (_packerErr) {
+        // best-effort release
+      }
+      try {
+        pm?.release();
+      } catch (_pmErr) {
+        // best-effort release
+      }
+    }
   }
 
   /**

@@ -15,6 +15,15 @@ export interface WindowRectEventWrap {
   windowId: number;
   reason: window.RectChangeReason;
   rect: window.Rect;
+  /**
+   * Issue Eulogizethesun/tauri#97: the same moment's
+   * `getWindowProperties().drawableRect` — the system's own inner口径 rect
+   * (position relative to the window, size = drawable area, px), read
+   * synchronously by the rect-change handler so the outer and inner snapshots
+   * in one wrap can never tear. Omitted when the sync read threw (window not
+   * created / content not loaded): the Rust side keeps the last snapshot.
+   */
+  drawable?: window.Rect;
 }
 
 /**

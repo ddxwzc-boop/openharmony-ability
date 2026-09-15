@@ -44,6 +44,7 @@ const ACKNOWLEDGEMENT_TYPE = "ohos.window.Acknowledgement";
 const STATE_RESPONSE_TYPE = "ohos.window.StateResponse";
 const IME_POSITION_RESPONSE_TYPE = "ohos.window.ImePositionResponse";
 const REAL_WINDOW_ID_RESPONSE_TYPE = "ohos.window.RealWindowIdResponse";
+const RECTS_RESPONSE_TYPE = "ohos.window.RectsResponse";
 const MAX_SAFE_INTEGER: number = 9007199254740991;
 const MAX_ARGB_COLOR: number = 0xffffffff;
 
@@ -238,6 +239,37 @@ class RealWindowIdResponse {
   }
 }
 
+/** Field-copied plain rect (deep copy of the system object, design.md D5). */
+class PlainRectResponse {
+  readonly top: number;
+  readonly left: number;
+  readonly width: number;
+  readonly height: number;
+
+  constructor(rect: window.Rect) {
+    this.top = rect.top;
+    this.left = rect.left;
+    this.width = rect.width;
+    this.height = rect.height;
+  }
+}
+
+/**
+ * Issue Eulogizethesun/tauri#97: one getWindowProperties() snapshot, both
+ * rects — windowRect (WM/outer, px) and drawableRect (drawable area, position
+ * relative to the window, px). The authoritative read-back source for
+ * verifying resize-inner landed the requested inner size.
+ */
+class WindowRectsResponse {
+  readonly windowRect: PlainRectResponse;
+  readonly drawableRect: PlainRectResponse;
+
+  constructor(windowRect: window.Rect, drawableRect: window.Rect) {
+    this.windowRect = new PlainRectResponse(windowRect);
+    this.drawableRect = new PlainRectResponse(drawableRect);
+  }
+}
+
 function parseAvoidAreaRequest(payload: BridgeTypedValue): AvoidAreaRequest {
   if (payload.typeName !== AVOID_AREA_REQUEST_TYPE || typeof payload.value !== "object") {
     throw new Error(`ohos.window.get-avoid-area requires bridge type ${AVOID_AREA_REQUEST_TYPE}`);
@@ -361,9 +393,9 @@ function parseMoveRequest(payload: BridgeTypedValue): WindowMoveRequest {
   return request;
 }
 
-function parseResizeRequest(payload: BridgeTypedValue): WindowResizeRequest {
+function parseResizeRequest(payload: BridgeTypedValue, action: string = "resize"): WindowResizeRequest {
   if (payload.typeName !== RESIZE_REQUEST_TYPE || typeof payload.value !== "object") {
-    throw new Error(`ohos.window.resize requires bridge type ${RESIZE_REQUEST_TYPE}`);
+    throw new Error(`ohos.window.${action} requires bridge type ${RESIZE_REQUEST_TYPE}`);
   }
   const request = payload.value as WindowResizeRequest;
   if (
@@ -373,7 +405,7 @@ function parseResizeRequest(payload: BridgeTypedValue): WindowResizeRequest {
     request.width <= 0 ||
     request.height <= 0
   ) {
-    throw new Error("resize.width and height must be positive");
+    throw new Error(`${action}.width and height must be positive`);
   }
   return request;
 }
@@ -618,6 +650,40 @@ export class WindowPlugin extends AsyncPluginBase {
 
     if (action === "focus") {
       const request = parseWindowIdRequest(payload);
+      if (request.windowId === 0) {
+        // Main window (issue Eulogizethesun/tauri#105): raiseToAppTop is
+        // subwindow-only per the official docs, so the old path was a silent
+        // no-effect for the main window. Use window.shiftAppWindowFocus
+        // (API 11+) — intra-app focus transfer between main/sub windows.
+        // Source window: the one the user last interacted with (typically the
+        // Float sub-window holding focus); falls back to the main window
+        // itself when untracked.
+        try {
+          const manager = WindowManager.getInstance();
+          const targetRealId = manager.getRealWindowId(0);
+          if (targetRealId < 0) {
+            throw new Error("main window not found");
+          }
+          let sourceRealId = targetRealId;
+          const lastInteracted = manager.getUserInteractedWindowId();
+          if (lastInteracted > 0) {
+            const resolved = manager.getRealWindowId(lastInteracted);
+            if (resolved >= 0) {
+              sourceRealId = resolved;
+            }
+          }
+          const windowModule: ESObject = window;
+          if (typeof windowModule.shiftAppWindowFocus !== "function") {
+            throw new Error("shiftAppWindowFocus is unavailable on this API level");
+          }
+          hilog.info(DOMAIN, TAG,
+            'focus: shiftAppWindowFocus src=%{public}d tgt=%{public}d', sourceRealId, targetRealId);
+          await (windowModule.shiftAppWindowFocus(sourceRealId, targetRealId) as Promise<void>);
+          return { typeName: ACKNOWLEDGEMENT_TYPE, value: new BridgeAcknowledgement(true) };
+        } catch (error) {
+          throw new Error(`focus (main window) failed: ${String(error)}`);
+        }
+      }
       const win = this.requireWindow(request.windowId, context);
       try {
         const dynamic: ESObject = this.dynamic(win);
@@ -672,6 +738,83 @@ export class WindowPlugin extends AsyncPluginBase {
         return { typeName: ACKNOWLEDGEMENT_TYPE, value: new BridgeAcknowledgement(true) };
       } catch (error) {
         throw new Error(`resize failed: ${String(error)}`);
+      }
+    }
+
+    if (action === "resize-inner") {
+      // Issue Eulogizethesun/tauri#97: INNER-size resize with the precise
+      // system decor. getWindowProperties() is a SYNC call returning ONE
+      // atomic snapshot: windowRect (outer, px) + drawableRect (drawable area,
+      // position relative to the window, px). chrome = outer − drawable per
+      // axis is the system's own title-bar inset — not an estimate, and unlike
+      // getWindowDecorHeight() (integer vp → ±2px quantization at density
+      // 1.9) it needs no unit conversion. Computed at DISPATCH time so the
+      // requested inner size lands exactly in one shot; a decor change that
+      // happens afterwards is the caller's business (no post-hoc correction).
+      // If the snapshot is unreadable or degenerate we THROW (→ Rust Err →
+      // tao warns + skips) — never resize to a guessed size.
+      const request = parseResizeRequest(payload, "resize-inner");
+      const win = this.requireWindow(request.windowId, context);
+      try {
+        const props = win.getWindowProperties();
+        const outer = props.windowRect;
+        const drawable = props.drawableRect;
+        let chromeWidth = 0;
+        let chromeHeight = 0;
+        if (drawable.width > 0 && drawable.height > 0) {
+          // Precise snapshot: both rects from one getWindowProperties() call.
+          if (outer.width <= 0 || outer.height <= 0) {
+            throw new Error(
+              `degenerate window rect (${outer.width}x${outer.height} — window state abnormal)`);
+          }
+          chromeWidth = outer.width - drawable.width;
+          chromeHeight = outer.height - drawable.height;
+          if (chromeWidth < 0 || chromeHeight < 0) {
+            throw new Error(
+              `drawable rect (${drawable.width}x${drawable.height}) exceeds window rect (${outer.width}x${outer.height})`);
+          }
+        } else if (request.windowId === 0) {
+          // Main window (tao windowId 0) with an unreadable/degenerate
+          // drawableRect (content not loaded yet, abnormal state) — no precise
+          // value: explicit failure, never resize to a guessed size.
+          // NOTE: the Float-subwindow branch below is keyed on windowId, not
+          // WindowProperties.type — this app's Float sub-windows are created
+          // via createSubWindow(WithOptions), which the framework reports as
+          // an APP SUB window (not TYPE_FLOAT), so a type check would never
+          // match (issue #97 review finding).
+          throw new Error(
+            `no precise decor available (outer=${outer.width}x${outer.height}, drawable=${drawable.width}x${drawable.height} — content not loaded / window state abnormal)`);
+        }
+        // else: Float sub-window (tao windowId > 0) with degenerate drawableRect
+        // — sub-windows are created with decorEnabled:false, so chrome 0 is
+        // exact BY CONSTRUCTION (not an estimate): outer = inner directly.
+        // Positive evidence for issue #97 verification: the exact chrome used.
+        hilog.info(DOMAIN, TAG,
+          "resize-inner %{public}d: inner=%{public}dx%{public}d chrome=%{public}dx%{public}d -> outer=%{public}dx%{public}d",
+          request.windowId, request.width, request.height, chromeWidth, chromeHeight,
+          request.width + chromeWidth, request.height + chromeHeight);
+        await win.resize(request.width + chromeWidth, request.height + chromeHeight);
+        return { typeName: ACKNOWLEDGEMENT_TYPE, value: new BridgeAcknowledgement(true) };
+      } catch (error) {
+        throw new Error(`resize-inner failed: ${String(error)}`);
+      }
+    }
+
+    if (action === "get-window-rects") {
+      // Issue Eulogizethesun/tauri#97: authoritative geometry read-back — one
+      // getWindowProperties() snapshot, both rects. Verification of
+      // resize-inner asserts against drawableRect here, never against a
+      // tao-side derived inner size.
+      const request = parseWindowIdRequest(payload);
+      const win = this.requireWindow(request.windowId, context);
+      try {
+        const props = win.getWindowProperties();
+        return {
+          typeName: RECTS_RESPONSE_TYPE,
+          value: new WindowRectsResponse(props.windowRect, props.drawableRect),
+        };
+      } catch (error) {
+        throw new Error(`get-window-rects failed: ${String(error)}`);
       }
     }
 
@@ -807,6 +950,41 @@ export class WindowPlugin extends AsyncPluginBase {
         return { typeName: ACKNOWLEDGEMENT_TYPE, value: new BridgeAcknowledgement(true) };
       } catch (error) {
         throw new Error(`set-draggable failed: ${String(error)}`);
+      }
+    }
+
+    if (action === "set-resize-by-drag") {
+      // The real "resizable" switch (issue Eulogizethesun/tauri#104), distinct
+      // from the decoration-flag bit that only toggles title-bar button
+      // visibility. Routed by window kind:
+      // - Main (UIAbility) window: setResizeByDragEnabled (API 14+) — only
+      //   effective in free-window state on PC/2in1 (silently ignored
+      //   otherwise, no error per official docs).
+      // - Float sub-window: enableDrag (API 20+, same as set-draggable).
+      const request = parseDraggableRequest(payload);
+      const win = WindowManager.getInstance().getWindow(request.windowId);
+      if (!win) {
+        throw new Error(`set-resize-by-drag: window ${request.windowId} not found`);
+      }
+      try {
+        if (request.windowId === 0) {
+          if (deviceInfo.sdkApiVersion < 14) {
+            throw new Error(`setResizeByDragEnabled requires API14+, current ${deviceInfo.sdkApiVersion}`);
+          }
+          hilog.info(DOMAIN, TAG,
+            'set-resize-by-drag: main window setResizeByDragEnabled=%{public}s', String(request.enable));
+          await win.setResizeByDragEnabled(request.enable);
+        } else {
+          if (deviceInfo.sdkApiVersion < 20) {
+            throw new Error(`enableDrag requires API20+ for sub-windows, current ${deviceInfo.sdkApiVersion}`);
+          }
+          hilog.info(DOMAIN, TAG,
+            'set-resize-by-drag: sub-window enableDrag=%{public}s', String(request.enable));
+          await win.enableDrag(request.enable);
+        }
+        return { typeName: ACKNOWLEDGEMENT_TYPE, value: new BridgeAcknowledgement(true) };
+      } catch (error) {
+        throw new Error(`set-resize-by-drag failed: ${String(error)}`);
       }
     }
 

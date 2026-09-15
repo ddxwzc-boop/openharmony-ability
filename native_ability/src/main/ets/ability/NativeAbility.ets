@@ -1,6 +1,7 @@
 import { AbilityConstant, Configuration, UIAbility, Want } from "@kit.AbilityKit";
 import common from "@ohos.app.ability.common";
 import window from "@ohos.window";
+import display from "@ohos.display";
 import webview from "@ohos.web.webview";
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { deviceInfo } from '@kit.BasicServicesKit';
@@ -11,6 +12,7 @@ import { MenuManager, PredefinedActionExecutor, setPredefinedActionExecutor } fr
 import { AboutMetadataData } from "../helper/menu_types";
 import { setCurrentAbilityName } from "../helper/StatusBarUtils";
 import { WindowManager, WindowSizeEventWrap, WindowRectEventWrap } from "../window/WindowManager";
+import { clearAllTrackedModifiers } from "../helper/accelerator_matcher";
 import { DOMAIN, NATIVE_MODULE_STORAGE_KEY } from '../helper/constants';
 import { setPrimaryWebviewControllerCallback } from "../components/DefaultXComponent";
 import { ProcessInitializer } from "./ProcessInitializer";
@@ -425,6 +427,13 @@ export class NativeAbility extends UIAbility {
 
     try {
       windowStage.on("windowStageEvent", (event: window.WindowStageEventType) => {
+        // 失焦清修饰键跟踪位(issue #111):窗口 INACTIVE(最小化/子窗/菜单抢
+        // 焦点)或 HIDDEN 期间发生的修饰键释放事件不会被 onKeyPreIme 看到,
+        // 脏位会让之后首个裸键被误拼成 ctrl+ 组合(真机实测复现过)。
+        if (event === window.WindowStageEventType.INACTIVE ||
+            event === window.WindowStageEventType.HIDDEN) {
+          clearAllTrackedModifiers();
+        }
         this.forEachLifecycle((lifecycle) =>
           lifecycle.windowStageEventCallback.onWindowStageEvent(event),
         );
@@ -442,6 +451,10 @@ export class NativeAbility extends UIAbility {
     }
 
     if (win) {
+      // Const capture for the closures below: `win` is a narrowed `let` —
+      // closure narrowing holds only while it is never reassigned later.
+      // A const makes that structural instead of accidental (issue #97 review).
+      const mainWindow: window.Window = win;
       try {
         win.on("windowSizeChange", (size: window.Size) => {
           // Phase 3 (design.md D2/D3): wrap with typed interface and route through
@@ -455,7 +468,7 @@ export class NativeAbility extends UIAbility {
             );
           }, 'size');
         });
-        win.on("windowRectChange", (options: window.RectChangeOptions) => {
+        mainWindow.on("windowRectChange", (options: window.RectChangeOptions) => {
           // Phase 3 (design.md D3): RECOVER→menubar logic stays synchronous (UI logic,
           // not throttled — must respond immediately on fullscreen exit).
           if (options.reason === window.RectChangeReason.RECOVER) {
@@ -464,10 +477,14 @@ export class NativeAbility extends UIAbility {
           }
           // Phase 3 (design.md D2/D5): rect dispatch through per-window(0) throttle.
           // Deep-copy rect fields (not system object ref) per design.md D5.
+          // Issue Eulogizethesun/tauri#97: attach the same moment's drawableRect
+          // (sync getWindowProperties snapshot) so the Rust inner-rect cache
+          // tracks the system's own inner口径 value — omitted when unreadable.
           const wrapped: WindowRectEventWrap = {
             windowId: 0,
             reason: options.reason,
-            rect: { left: options.rect.left, top: options.rect.top, width: options.rect.width, height: options.rect.height }
+            rect: { left: options.rect.left, top: options.rect.top, width: options.rect.width, height: options.rect.height },
+            drawable: WindowManager.readDrawableRect(mainWindow)
           };
           WindowManager.getInstance().throttledRectDispatch(0, wrapped, (w: object) => {
             this.forEachLifecycle((lifecycle) =>
@@ -506,6 +523,18 @@ export class NativeAbility extends UIAbility {
           }
         } catch (e) {
           hilog.warn(DOMAIN, 'NativeAbility', 'windowStatusChange registration failed: %{public}s', String(e));
+        }
+
+        // 多显示器布局回灌(issue Eulogizethesun/tauri#106):Rust 侧 C API
+        // OH_NativeDisplayManager_CreateAllDisplays 枚举显示器列表,但其
+        // DisplayInfo 结构无 x/y 坐标——位置只能来自 ArkTS Display.x/y
+        // (API 19+,低版本 undefined → 0,与修复前一致)。这里推送全量布局,
+        // 并监听 add/remove/change 热插拔刷新。getAllDisplays 为 API 12+。
+        this.pushDisplayLayout();
+        try {
+          display.on('change', () => this.pushDisplayLayout());
+        } catch (e) {
+          hilog.warn(DOMAIN, 'NativeAbility', 'display.on(change) registration failed: %{public}s', String(e));
         }
       } catch (e) {
         hilog.error(DOMAIN, 'NativeAbility', 'Window event registration failed: %{public}s', String(e));
@@ -555,6 +584,30 @@ export class NativeAbility extends UIAbility {
     void this.onWindowStageCreate(windowStage);
   }
 
+  // 多显示器布局推送(issue Eulogizethesun/tauri#106):把 getAllDisplays 的
+  // id/位置全量推给 Rust(set_display_layout NAPI)。位置来自 Display.x/y
+  // (API 19+;低版本 undefined → 0,不比修复前差)。Rust 侧把它叠加到 C API
+  // CreateAllDisplays 的显示器列表上(C 结构体无 x/y 字段)。
+  private pushDisplayLayout(): void {
+    try {
+      display.getAllDisplays().then((displays: Array<display.Display>) => {
+        const nativeModule: Module | undefined = AppStorage.get<Module>(NATIVE_MODULE_STORAGE_KEY);
+        if (!nativeModule || typeof nativeModule.setDisplayLayout !== 'function') {
+          return;
+        }
+        const layout: Array<Array<number>> = [];
+        for (const d of displays) {
+          layout.push([d.id, d.x ?? 0, d.y ?? 0]);
+        }
+        nativeModule.setDisplayLayout(JSON.stringify(layout));
+      }).catch((err: ESObject) => {
+        hilog.warn(DOMAIN, 'NativeAbility', 'getAllDisplays rejected: %{public}s', String(err));
+      });
+    } catch (e) {
+      hilog.warn(DOMAIN, 'NativeAbility', 'pushDisplayLayout failed: %{public}s', String(e));
+    }
+  }
+
   onWindowStageDestroy(): void | Promise<void> {
     this.forEachLifecycle((lifecycle) => lifecycle.windowStageEventCallback.onWindowStageDestroy());
     try {
@@ -584,6 +637,46 @@ export class NativeAbility extends UIAbility {
         payload: new BridgeMemoryLevelLifecyclePayload(level),
       });
     });
+  }
+
+  /**
+   * PC/2in1 pre-close interception (issue Eulogizethesun/tauri#103).
+   *
+   * Fired BEFORE any teardown when the app is closed via the window close
+   * button, taskbar shortcut ("退出"/"关闭所有窗口") or tray exit — the only
+   * point where a close is still cancellable (onDestroy returns void and the
+   * process dies ~12ms later, so prevent_exit() there is cosmetic by design).
+   * Requires ohos.permission.PREPARE_APP_TERMINATE (normal, system_grant)
+   * declared in the app's module.json5; not called on Phone form factors.
+   *
+   * Asks every Rust lifecycle SYNCHRONOUSLY (same inline dispatch pattern as
+   * the onAbilityDestroy call in onDestroy): the tao event loop forwards the
+   * probe as an ExitRequested dispatch where tauri's prevent_exit() lands —
+   * this is the wiring that makes prevent_exit genuinely stop
+   * system-initiated exits instead of firing into an unstoppable teardown.
+   *
+   * @returns true to CANCEL this termination (app keeps running),
+   *          false to allow it (the normal onBackground→onDestroy chain
+   *          follows).
+   */
+  async onPrepareToTerminateAsync(): Promise<boolean> {
+    hilog.info(DOMAIN, 'NativeAbility', 'onPrepareToTerminateAsync: asking Rust lifecycles');
+    let prevent = false;
+    this.forEachLifecycle((lifecycle) => {
+      try {
+        if (lifecycle.windowStageEventCallback.onPrepareToTerminate()) {
+          prevent = true;
+        }
+      } catch (e) {
+        // One module's probe failing must not block termination — treat that
+        // module as "allow" and keep asking the others.
+        hilog.error(DOMAIN, 'NativeAbility',
+          'onPrepareToTerminate (module probe) failed: %{public}s', String(e));
+      }
+    });
+    hilog.info(DOMAIN, 'NativeAbility',
+      'onPrepareToTerminateAsync: prevent=%{public}s', String(prevent));
+    return prevent;
   }
 
   onDestroy(): Promise<void> {

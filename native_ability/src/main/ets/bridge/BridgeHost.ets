@@ -614,10 +614,14 @@ class BridgeHost {
       try {
         // Phase 3 (design.md D2/D3/D5): route through per-window(0) throttle.
         // Deep-copy rect fields (not system object ref) per design.md D5.
+        // Issue Eulogizethesun/tauri#97: attach the same moment's drawableRect
+        // (sync getWindowProperties snapshot) so the Rust inner-rect cache
+        // tracks the system's own inner口径 value — omitted when unreadable.
         const wrapped: WindowRectEventWrap = {
           windowId: 0,
           reason: options.reason,
-          rect: { left: options.rect.left, top: options.rect.top, width: options.rect.width, height: options.rect.height }
+          rect: { left: options.rect.left, top: options.rect.top, width: options.rect.width, height: options.rect.height },
+          drawable: WindowManager.readDrawableRect(componentWindow)
         };
         WindowManager.getInstance().throttledRectDispatch(0, wrapped, (w: object) => {
           if (this.component !== state || this.closing || this.disposed) {

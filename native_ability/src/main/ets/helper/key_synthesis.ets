@@ -46,6 +46,27 @@ interface ModifierState {
 /** windowId -> attached webview controller (fed by WebviewPlugin.handleControllerAttached) */
 const controllers: Map<number, web_webview.WebviewController> = new Map();
 
+/**
+ * windowId -> Web component focused (fed by WebviewPlugin's Web.onFocus/onBlur).
+ * Gate for the Rust key forward (issue Eulogizethesun/tauri#109): while the
+ * main-window Web is focused the NDK XComponent key path is structurally
+ * silent (the render node is not in the ArkUI focus chain), so forwarding
+ * from onKeyPreIme cannot double-dispatch; while it is unfocused the gate
+ * closes and the NDK path (if ever alive) stays exclusive. Also keeps
+ * webview-less (GL-style) apps unchanged: no Web ⇒ no forward.
+ */
+const webFocused: Map<number, boolean> = new Map();
+
+/** Web focus state setter — called from WebviewPlugin's Web.onFocus/onBlur. */
+export function setWebFocused(windowId: number, focused: boolean): void {
+  webFocused.set(windowId, focused);
+}
+
+/** Web focus state reader — gates the Rust key forward in MainPage.onKeyPreIme. */
+export function isWebFocused(windowId: number): boolean {
+  return webFocused.get(windowId) ?? false;
+}
+
 /** Keys currently held — repeat = Down for an already-held key (mirrors tao's PRESSED_KEYS). */
 const pressedKeys: Set<number> = new Set();
 

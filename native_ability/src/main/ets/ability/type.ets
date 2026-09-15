@@ -57,6 +57,9 @@ export interface WindowStageEventCallback {
   onWindowRectChange: (arg: object) => void;
   onAvoidAreaChange: (arg: object) => void;
   onNewWant: (data: NewWantData) => void;
+  // PC/2in1 pre-close probe (onPrepareToTerminateAsync). Return true to CANCEL
+  // this termination, false to allow it (normal destroy chain follows).
+  onPrepareToTerminate: () => boolean;
 }
 
 export interface WebViewComponentEventCallback {
@@ -192,10 +195,16 @@ export interface Module {
   notifyWindowClose?: (windowId: number) => void;
   /** `notify_window_status` — NativeAbility windowStatusChange fan-in. */
   notifyWindowStatus?: (windowId: number, status: number) => void;
+  /** `set_display_layout` — display.getAllDisplays() position overlay push
+   *  (multi-monitor, issue Eulogizethesun/tauri#106). JSON `[[id, x, y], ...]`. */
+  setDisplayLayout?: (layoutJson: string) => void;
   /** `read_continue_snapshot` — onContinue source-side snapshot read. */
   readContinueSnapshot?: () => string;
   /** `update_cursor_position` — MainPage onMouse cursor tracking. */
   updateCursorPosition?: (x: number, y: number) => void;
+  /** `notify_key_event` — MainPage onKeyPreIme Rust key forward (issue #109).
+   *  action: 0 = Down, 1 = Up. */
+  notifyKeyEvent?: (keyCode: number, action: number, deviceId: number) => void;
   /** `register_create_sub_window_tsfn` — legacy create_os_window path hookup. */
   registerCreateSubWindowTsfn?: (
     createSubWindow: (config: ESObject) => Promise<number>,

@@ -24,6 +24,7 @@ import {
   notifyPrimaryWebviewController,
   notifyKeySynthesisController,
   KEY_SYNTHESIS_SHIM,
+  setWebFocused,
 } from "@ohos-rs/ability";
 
 const CREATE_REQUEST_TYPE = "ohos.webview.CreateRequest";
@@ -1306,6 +1307,12 @@ function BuildWebview(data: ManagedWebview) {
         .onControllerAttached(() => {
           handleControllerAttached(data);
         })
+        // Web focus tracking (issue Eulogizethesun/tauri#109): gates the
+        // MainPage.onKeyPreIme → Rust key forward. Web focused ⇒ NDK
+        // XComponent key path structurally silent ⇒ forward is exclusive;
+        // unfocused ⇒ gate closed ⇒ NDK path (if ever alive) stays exclusive.
+        .onFocus(() => setWebFocused(data.windowId ?? 0, true))
+        .onBlur(() => setWebFocused(data.windowId ?? 0, false))
         .onLoadIntercept((event) => handleLoadIntercept(data, event.data.getRequestUrl()))
         .onInterceptRequest((event) => {
           return handleWebviewInterceptRequest(data, event as WebInterceptRequestEvent, '');
@@ -1374,6 +1381,9 @@ function BuildWebview(data: ManagedWebview) {
       .onControllerAttached(() => {
         handleControllerAttached(data);
       })
+      // Web focus tracking (issue Eulogizethesun/tauri#109) — see overlay branch comment.
+      .onFocus(() => setWebFocused(data.windowId ?? 0, true))
+      .onBlur(() => setWebFocused(data.windowId ?? 0, false))
       .onLoadIntercept((event) => handleLoadIntercept(data, event.data.getRequestUrl()))
       .onInterceptRequest((event) => {
         return handleWebviewInterceptRequest(data, event as WebInterceptRequestEvent, '(embedded)');

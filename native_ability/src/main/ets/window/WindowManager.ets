@@ -1098,10 +1098,14 @@ export class WindowManager {
         try {
           // Phase 3 (design.md D5): deep-copy rect fields — do not store system object ref.
           // Phase 3 (design.md D3): route through per-window throttle (leading+trailing 16ms).
+          // Issue Eulogizethesun/tauri#97: attach the same moment's drawableRect
+          // (sync getWindowProperties snapshot) so the Rust inner-rect cache
+          // tracks the system's own inner口径 value — omitted when unreadable.
           const wrapped: WindowRectEventWrap = {
             windowId,
             reason: options.reason,
-            rect: { left: options.rect.left, top: options.rect.top, width: options.rect.width, height: options.rect.height }
+            rect: { left: options.rect.left, top: options.rect.top, width: options.rect.width, height: options.rect.height },
+            drawable: WindowManager.readDrawableRect(win)
           };
           this.throttledRectDispatch(windowId, wrapped, (w: object) => {
             this.rectChangeCallback?.(w as WindowRectEventWrap);
@@ -1351,6 +1355,36 @@ export class WindowManager {
 
   unregisterRectChangeCallback(): void {
     this.rectChangeCallback = undefined;
+  }
+
+  /**
+   * Issue Eulogizethesun/tauri#97: synchronous drawableRect read for
+   * rect-change wraps. One getWindowProperties() snapshot — the system's own
+   * inner口径 rect (position relative to the window, size = drawable area, px),
+   * replacing the removed window-rect − content-rect decor estimate (whose
+   * async races produced garbage values and the shrinking-window bug).
+   * Returns undefined when the call throws (window not created / content not
+   * loaded) or the rect is degenerate — callers omit the field and the Rust
+   * side keeps its last snapshot. Never returns an estimated value.
+   */
+  static readDrawableRect(win: window.Window): window.Rect | undefined {
+    try {
+      const drawable = win.getWindowProperties().drawableRect;
+      if (drawable.width > 0 && drawable.height > 0) {
+        // Typed local first — object literals into a union return type are an
+        // arkts-no-untyped-obj-literals compile risk.
+        const rect: window.Rect = {
+          left: drawable.left,
+          top: drawable.top,
+          width: drawable.width,
+          height: drawable.height
+        };
+        return rect;
+      }
+    } catch (e) {
+      hilog.debug(DOMAIN, 'WindowManager', 'readDrawableRect: getWindowProperties unavailable: %{public}s', String(e));
+    }
+    return undefined;
   }
 
   /** Get the current blur radius for a window (set by applyWindowBlur). Used by WebviewPlugin

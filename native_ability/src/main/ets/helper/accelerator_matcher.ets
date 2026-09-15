@@ -34,6 +34,39 @@ const MODIFIER_KEYCODES: Set<number> = new Set([
   2077, // KEYCODE_META_RIGHT
 ]);
 
+// Same keycodes mapped to the combo-string modifier names used by
+// `isModifierPressed` (issue #111 modifier tracking).
+const MODIFIER_KEYCODE_TO_NAME: Map<number, string> = new Map<number, string>();
+MODIFIER_KEYCODE_TO_NAME.set(2072, 'ctrl');
+MODIFIER_KEYCODE_TO_NAME.set(2073, 'ctrl');
+MODIFIER_KEYCODE_TO_NAME.set(2047, 'shift');
+MODIFIER_KEYCODE_TO_NAME.set(2048, 'shift');
+MODIFIER_KEYCODE_TO_NAME.set(2045, 'alt');
+MODIFIER_KEYCODE_TO_NAME.set(2046, 'alt');
+
+/**
+ * Modifier keys tracked from their own down/up events (issue #111 device
+ * finding, 2026-09-10: `getModifierKeyState` reports Ctrl as NOT pressed for
+ * real Ctrl+key presses on the 2in1 device — combos collapsed to e.g. "z"
+ * and never matched. Modifier keydown/keyup events DO flow through
+ * onKeyPreIme (keyCode 2072 etc.), so tracking them is API-independent and
+ * deterministic).
+ *
+ * MODULE-level (not per-matcher): releases that happen while the window is
+ * unfocused are never seen (minimize while Ctrl held, dropdown sub-window
+ * taking focus, app switch) and would leave stale bits — any later bare key
+ * would false-positive a "ctrl+…" combo (observed on device: a plain `m`
+ * re-triggered Minimize after a Ctrl+M minimize). `clearAllTrackedModifiers`
+ * is called on window INACTIVE/HIDDEN (NativeAbility) and on menu open
+ * (MenuBarComponent) to flush exactly those stale bits.
+ */
+const trackedModifiers: Set<string> = new Set();
+
+/** Flush every matcher's tracked modifiers (window focus loss / menu open). */
+export function clearAllTrackedModifiers(): void {
+  trackedModifiers.clear();
+}
+
 // Clipboard accelerators handled natively by webview — intercepting them breaks paste/copy/cut
 const CLIPBOARD_ACCELERATORS: Set<string> = new Set([
   'ctrl+c',   // copy
@@ -67,24 +100,65 @@ export class AcceleratorMatcher {
     return accel.toLowerCase();
   }
 
-  matches(event: KeyEvent): boolean {
+  /**
+   * Update the shared tracked-modifier set from a key event. Must run for
+   * EVERY event (including modifier-only ones, which the match methods
+   * otherwise skip) — all three public match methods call this first.
+   */
+  trackModifiers(event: KeyEvent): void {
+    const modifier = MODIFIER_KEYCODE_TO_NAME.get(event.keyCode);
+    if (modifier !== undefined) {
+      if (event.type === KeyType.Down) {
+        trackedModifiers.add(modifier);
+      } else if (event.type === KeyType.Up) {
+        trackedModifiers.delete(modifier);
+      }
+    }
+  }
+
+  /** Drop this matcher's tracked modifiers (see module doc for when). */
+  clearTrackedModifiers(): void {
+    trackedModifiers.clear();
+  }
+
+  /**
+   * Build the combo string ("ctrl+shift+…+key") for a key event, or null
+   * when the event cannot start a combo (not a Down, modifier-only, or no
+   * readable key text). Also updates the tracked modifiers. Shared by the
+   * closed-menu match (onKeyPreIme) and the open-menu handler
+   * (MenuBarComponent's Menu.onKeyEvent — keyboardShortcut does not fire
+   * inside menu sub-windows on device, but Menu nodes DO receive the
+   * KeyEvent through the focus chain).
+   */
+  buildComboForEvent(event: KeyEvent): string | null {
+    this.trackModifiers(event);
     if (event.type !== KeyType.Down) {
-      return false;
+      return null;
     }
     // Skip modifier-only key events (Ctrl/Shift/Alt arrive separately)
     if (MODIFIER_KEYCODES.has(event.keyCode)) {
-      return false;
+      return null;
     }
     const keyText = this.getKeyText(event);
     if (!keyText) {
-      return false;
+      return null;
     }
     let combo = '';
     if (this.isModifierPressed(event, 'Ctrl')) combo += 'ctrl+';
     if (this.isModifierPressed(event, 'Shift')) combo += 'shift+';
     if (this.isModifierPressed(event, 'Alt')) combo += 'alt+';
-    combo += keyText.toLowerCase();
+    return combo + keyText.toLowerCase();
+  }
+
+  matches(event: KeyEvent): boolean {
+    const combo = this.buildComboForEvent(event);
+    if (combo === null) {
+      return false;
+    }
     // Clipboard shortcuts handled natively by webview — don't intercept
+    // (only applies to the closed-menu path; while a menu sub-window holds
+    // focus the webview sees no keys at all, and the open-menu handler in
+    // MenuBarComponent does its own lookup without this exclusion).
     if (CLIPBOARD_ACCELERATORS.has(combo)) {
       return false;
     }
@@ -97,15 +171,21 @@ export class AcceleratorMatcher {
   }
 
   private isModifierPressed(event: KeyEvent, modifier: string): boolean {
-    if (!event.getModifierKeyState) {
-      return false;
+    // Primary: tracking from modifier keydown/keyup events —
+    // getModifierKeyState is unreliable on device (see module doc).
+    if (trackedModifiers.has(modifier)) {
+      return true;
     }
-    const result = event.getModifierKeyState([modifier]);
-    if (typeof result === 'boolean') {
-      return result;
-    }
-    if (result && typeof result === 'object') {
-      return !!result[modifier];
+    // Fallback: the API, for events that bypassed tracking (e.g. a key
+    // arriving mid-combo from a window that never saw the modifier down).
+    if (event.getModifierKeyState) {
+      const result = event.getModifierKeyState([modifier]);
+      if (typeof result === 'boolean') {
+        return result;
+      }
+      if (result && typeof result === 'object') {
+        return !!result[modifier];
+      }
     }
     return false;
   }
@@ -121,6 +201,7 @@ export class AcceleratorMatcher {
    * this method identifies them so the caller can consume them when clipboard is disabled.
    */
   matchesClipboardShortcut(event: KeyEvent): boolean {
+    this.trackModifiers(event);
     if (event.type !== KeyType.Down) {
       return false;
     }
@@ -143,6 +224,7 @@ export class AcceleratorMatcher {
    * See ohos-webview-flag-zoom-hotkeys spec.
    */
   matchesZoomShortcut(event: KeyEvent): boolean {
+    this.trackModifiers(event);
     if (event.type !== KeyType.Down) {
       return false;
     }

@@ -24,7 +24,7 @@ if (-not $ScriptDir) { $ScriptDir = $PSScriptRoot }
 # path, failing Test-Path with ItemExistsArgumentError).
 $ScriptDir = $ScriptDir.Trim('"\')
 
-# (plugin-dir, exported-class) — the 17 core bridge plugins.
+# (plugin-dir, exported-class) — the 18 core bridge plugins.
 $plugins = @(
   @{ name = 'accessibility';   cls = 'AccessibilityPlugin' },
   @{ name = 'app-control';     cls = 'AppControlPlugin' },
@@ -42,6 +42,7 @@ $plugins = @(
   @{ name = 'updater';         cls = 'UpdaterPlugin' },
   @{ name = 'url';             cls = 'UrlPlugin' },
   @{ name = 'webview';         cls = 'WebviewPlugin' },
+  @{ name = 'webview-cookie';  cls = 'WebviewCookiePlugin' },
   @{ name = 'window';          cls = 'WindowPlugin' }
 )
 

@@ -11,7 +11,7 @@ import {
 import { KeyCode } from "@kit.InputKit";
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { DOMAIN, MAIN_WINDOW_ID } from '../helper/constants';
-import { synthesizeDomKeyEvent } from '../helper/key_synthesis';
+import { synthesizeDomKeyEvent, isWebFocused } from '../helper/key_synthesis';
 import { WindowManager } from '../window/WindowManager';
 import { NativeModuleLoader } from "../runtime/NativeModuleLoader";
 import { invokeNativeBackPressInterceptor } from "../runtime/BackPress";
@@ -131,6 +131,26 @@ struct MainPage {
         // synthetic + unsuppressed degenerate native). They keep the
         // pre-feature degradation, matching the ohos-platform-limitations spec.
         if (this.windowId === MAIN_WINDOW_ID) {
+          // Rust-side key forward (issue Eulogizethesun/tauri#109): the NDK
+          // XComponent key path never fires in webview apps (the render node
+          // is not in the ArkUI focus chain — no focusable, Web grabs focus
+          // on load and overlays it), so tao's WindowEvent::KeyboardInput was
+          // dead. onKeyPreIme sees every key the web sees — feed them to Rust
+          // through the same Event::Input dispatch the NDK path would have
+          // used. Gated on Web focus: focused ⇒ NDK structurally silent ⇒ no
+          // double dispatch; unfocused (menu bar / GL-style apps) ⇒ gate
+          // closed ⇒ NDK path stays exclusive (and webview-less apps are
+          // unchanged, per the key-synthesis spec). Same fall-through position
+          // as the DOM synthesis — keys consumed by the interceptors above
+          // are NOT forwarded (the shell already acted on them).
+          if (isWebFocused(MAIN_WINDOW_ID) &&
+              typeof this.nativeModule?.notifyKeyEvent === "function") {
+            this.nativeModule.notifyKeyEvent(
+              event.keyCode,
+              event.type === KeyType.Down ? 0 : 1,
+              event.deviceId,
+            );
+          }
           synthesizeDomKeyEvent(event, this.windowId);
         }
         return false;
