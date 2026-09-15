@@ -242,8 +242,13 @@ export struct MenuBarComponent {
    * Maps a nativeIcon string (e.g. "sys.symbol.plus") to the raw symbol Resource.
    * $r() requires compile-time string literals, so we use a switch/case for known-valid variants
    * (names validated against the SDK's sysResource.js symbol table).
-   * All 56 NativeIcon variants are mapped (issue Eulogizethesun/tauri#112) — keep this
+   * 54 of 56 NativeIcon variants are mapped (issue Eulogizethesun/tauri#112) — keep this
    * switch in sync with `native_icon_to_ohos` in muda/src/platform_impl/ohos/mod.rs.
+   * The two unmapped ones (sys.symbol.person_3, sys.symbol.circle_fill) are absent from
+   * the minimum supported SDK 5.0.0(12) resource table (first public in API 20 /
+   * HarmonyOS 6.0.0; 5.1.0 carries them only as private entries), so a `$r()` literal
+   * would fail the ArkTS build for apps building with 5.x-era SDKs. They fall through
+   * to `default` → null (no icon). Re-add both cases once the floor reaches API 20.
    * Returns null for unknown strings, which renders as no icon.
    */
   private nativeIconResource(nativeIcon: string): Resource | null {
@@ -266,8 +271,6 @@ export struct MenuBarComponent {
         return $r("sys.symbol.monitor_fill");
       case "sys.symbol.fullscreen":
         return $r("sys.symbol.fullscreen");
-      case "sys.symbol.person_3":
-        return $r("sys.symbol.person_3");
       case "sys.symbol.arrow_down_right_and_arrow_up_left":
         return $r("sys.symbol.arrow_down_right_and_arrow_up_left");
       case "sys.symbol.square_stack_3d":
@@ -334,8 +337,6 @@ export struct MenuBarComponent {
         return $r("sys.symbol.play_video");
       case "sys.symbol.wand_and_stars":
         return $r("sys.symbol.wand_and_stars");
-      case "sys.symbol.circle_fill":
-        return $r("sys.symbol.circle_fill");
       case "sys.symbol.circle":
         return $r("sys.symbol.circle");
       case "sys.symbol.circle_lefthalf_inset_filled":
